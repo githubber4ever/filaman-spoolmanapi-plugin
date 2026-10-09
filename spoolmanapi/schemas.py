@@ -331,12 +331,12 @@ class ExtraField(BaseModel):
 
 class ExtraFieldParameters(BaseModel):
     """POST /field/{entity_type}/{key} body."""
-    name: str
+    name: str = Field(min_length=1, max_length=128)
     order: int = 0
-    unit: str | None = None
+    unit: str | None = Field(None, min_length=1, max_length=16)
     field_type: ExtraFieldType = ExtraFieldType.text
     default_value: str | None = None
-    choices: list[str] | None = None
+    choices: list[str] | None = Field(None, min_length=1)
     multi_choice: bool | None = None
 
 

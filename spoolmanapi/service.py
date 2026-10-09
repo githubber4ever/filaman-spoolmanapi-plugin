@@ -7,13 +7,16 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import HTTPException, status
 from sqlalchemy import select, func, or_
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.rfid import rfid_hex_key, rfid_storage_value, rfid_uids_equal
 from app.models.filament import Manufacturer, Filament, Color, FilamentColor
 from app.models.spool import Spool, SpoolEvent, SpoolStatus
+from app.models.system_extra_field import SystemExtraField
 from app.models.tag_reader import TagReader as FilaManTagReader
 from app.models.location import Location
 from app.services.spool_service import SpoolService
@@ -94,6 +97,201 @@ def _clear_legacy_card_uids(spool: Spool) -> None:
 
 def _decode_extra(extra: dict[str, str] | None) -> dict[str, Any]:
     return {key: json.loads(value) for key, value in (extra or {}).items()}
+
+
+def _system_extra_field_type(field: SystemExtraField) -> schemas.ExtraFieldType | None:
+    field_type = field.field_type
+    config = field.config or {}
+    integer_precision = config.get("decimal_places") == 0
+
+    if field_type == "text" or field_type in {"url", "textarea"}:
+        return schemas.ExtraFieldType.text
+    if field_type == "number":
+        return (
+            schemas.ExtraFieldType.integer
+            if integer_precision
+            else schemas.ExtraFieldType.float_type
+        )
+    if field_type == "range":
+        return (
+            schemas.ExtraFieldType.integer_range
+            if integer_precision
+            else schemas.ExtraFieldType.float_range
+        )
+    if field_type in {"date", "datetime"}:
+        return schemas.ExtraFieldType.datetime_type
+    if field_type == "checkbox":
+        return schemas.ExtraFieldType.boolean
+    if field_type in {"dropdown", "multiselect"}:
+        return schemas.ExtraFieldType.choice
+    return None
+
+
+def _native_system_extra_field_type(
+    field_type: schemas.ExtraFieldType,
+    multi_choice: bool | None,
+) -> tuple[str, dict[str, Any]]:
+    if field_type == schemas.ExtraFieldType.text:
+        return "text", {}
+    if field_type in {
+        schemas.ExtraFieldType.integer,
+        schemas.ExtraFieldType.float_type,
+    }:
+        config = (
+            {"decimal_places": 0}
+            if field_type == schemas.ExtraFieldType.integer
+            else {}
+        )
+        return "number", config
+    if field_type in {
+        schemas.ExtraFieldType.integer_range,
+        schemas.ExtraFieldType.float_range,
+    }:
+        config = (
+            {"decimal_places": 0}
+            if field_type == schemas.ExtraFieldType.integer_range
+            else {}
+        )
+        return "range", config
+    if field_type == schemas.ExtraFieldType.datetime_type:
+        return "datetime", {}
+    if field_type == schemas.ExtraFieldType.boolean:
+        return "checkbox", {}
+    if field_type == schemas.ExtraFieldType.choice:
+        return ("multiselect" if multi_choice else "dropdown"), {}
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=f"Unsupported Spoolman field type: {field_type}",
+    )
+
+
+def _decode_spoolman_field_default(
+    field_type: schemas.ExtraFieldType,
+    default_value: str | None,
+    choices: list[str] | None,
+    multi_choice: bool | None,
+) -> Any:
+    if default_value is None:
+        return None
+    try:
+        value = json.loads(default_value)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Extra-field default_value must contain valid JSON.",
+        ) from exc
+
+    valid = False
+    if field_type == schemas.ExtraFieldType.text:
+        valid = isinstance(value, str)
+    elif field_type == schemas.ExtraFieldType.integer:
+        valid = isinstance(value, int) and not isinstance(value, bool)
+    elif field_type == schemas.ExtraFieldType.float_type:
+        valid = isinstance(value, int | float) and not isinstance(value, bool)
+    elif field_type == schemas.ExtraFieldType.integer_range:
+        valid = (
+            isinstance(value, list)
+            and len(value) == 2
+            and all(
+                item is None
+                or (isinstance(item, int) and not isinstance(item, bool))
+                for item in value
+            )
+        )
+    elif field_type == schemas.ExtraFieldType.float_range:
+        valid = (
+            isinstance(value, list)
+            and len(value) == 2
+            and all(
+                item is None
+                or (isinstance(item, int | float) and not isinstance(item, bool))
+                for item in value
+            )
+        )
+    elif field_type == schemas.ExtraFieldType.datetime_type:
+        valid = isinstance(value, str)
+    elif field_type == schemas.ExtraFieldType.boolean:
+        valid = isinstance(value, bool)
+    elif field_type == schemas.ExtraFieldType.choice:
+        if multi_choice is False:
+            valid = isinstance(value, str) and (choices is None or value in choices)
+        elif multi_choice is True:
+            valid = (
+                isinstance(value, list)
+                and all(isinstance(item, str) for item in value)
+                and (choices is None or all(item in choices for item in value))
+            )
+    if not valid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid default_value for Spoolman field type {field_type.value!r}.",
+        )
+    return value
+
+
+def _native_default_value(
+    field_type: schemas.ExtraFieldType,
+    value: Any,
+) -> str | None:
+    if value is None:
+        return None
+    if field_type in {
+        schemas.ExtraFieldType.integer_range,
+        schemas.ExtraFieldType.float_range,
+    }:
+        lower, upper = value
+        value = {
+            **({"min": lower} if lower is not None else {}),
+            **({"max": upper} if upper is not None else {}),
+        }
+    if field_type == schemas.ExtraFieldType.choice and isinstance(value, list):
+        return json.dumps(value, separators=(",", ":"))
+    if isinstance(value, bool):
+        return str(value).lower()
+    if isinstance(value, str):
+        return value
+    return json.dumps(value, separators=(",", ":"))
+
+
+def _spoolman_default_value(field: SystemExtraField) -> str | None:
+    if field.default_value is None:
+        return None
+    mapped_type = _system_extra_field_type(field)
+    if mapped_type is None:
+        return None
+
+    try:
+        if field.field_type in {
+            "text",
+            "url",
+            "textarea",
+            "date",
+            "datetime",
+            "dropdown",
+        }:
+            value: Any = field.default_value
+        elif field.field_type == "checkbox":
+            if field.default_value not in {"true", "false"}:
+                return None
+            value = field.default_value == "true"
+        else:
+            value = json.loads(field.default_value)
+        if field.field_type == "range":
+            if not isinstance(value, dict):
+                return None
+            value = [value.get("min"), value.get("max")]
+        elif field.field_type == "multiselect":
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                return None
+        elif mapped_type == schemas.ExtraFieldType.integer:
+            if not isinstance(value, int) or isinstance(value, bool):
+                return None
+        elif mapped_type == schemas.ExtraFieldType.float_type:
+            if not isinstance(value, int | float) or isinstance(value, bool):
+                return None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+    return json.dumps(value, separators=(",", ":"))
 
 
 def _weight_to_length_mm(weight_g: float, diameter_mm: float, density_g_cm3: float) -> float:
@@ -1115,14 +1313,191 @@ class SpoolmanService:
     async def set_setting(self, key: str, value: Any) -> dict | None:
         return {"value": str(value), "is_set": True, "type": "string"}
 
-    async def get_extra_fields(self, entity_type: str) -> list:
-        return []
+    async def get_extra_fields(self, entity_type: str) -> list[schemas.ExtraField]:
+        if entity_type == schemas.EntityType.vendor.value:
+            return []
 
-    async def add_extra_field(self, entity_type: str, key: str, data: dict) -> list:
-        return []
+        result = await self.db.execute(
+            select(SystemExtraField)
+            .where(SystemExtraField.target_type == entity_type)
+            .order_by(SystemExtraField.id)
+        )
+        fields: list[schemas.ExtraField] = []
+        for native_field in result.scalars().all():
+            field_type = _system_extra_field_type(native_field)
+            if field_type is None:
+                continue
 
-    async def delete_extra_field(self, entity_type: str, key: str) -> list | None:
-        return []
+            config = native_field.config or {}
+            unit = config.get("unit")
+            is_choice = native_field.field_type in {"dropdown", "multiselect"}
+            fields.append(
+                schemas.ExtraField(
+                    name=native_field.label,
+                    order=len(fields),
+                    unit=unit if isinstance(unit, str) else None,
+                    field_type=field_type,
+                    default_value=_spoolman_default_value(native_field),
+                    key=native_field.key,
+                    entity_type=schemas.EntityType(entity_type),
+                    choices=native_field.options if is_choice else None,
+                    multi_choice=(
+                        native_field.field_type == "multiselect"
+                        if is_choice
+                        else None
+                    ),
+                )
+            )
+        return fields
+
+    async def add_extra_field(
+        self, entity_type: str, key: str, data: dict
+    ) -> list[schemas.ExtraField]:
+        if entity_type == schemas.EntityType.vendor.value:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="FilaMan System Extra Fields only support filament and spool.",
+            )
+
+        result = await self.db.execute(
+            select(SystemExtraField).where(
+                SystemExtraField.target_type == entity_type
+            )
+        )
+        existing_field = None
+        for existing in result.scalars().all():
+            if existing.key == key:
+                existing_field = existing
+                continue
+            if existing.key.startswith(f"{key}.") or key.startswith(f"{existing.key}."):
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Extra-field key conflicts with existing field {existing.key!r}.",
+                )
+
+        field_type = data["field_type"]
+        is_choice = field_type == schemas.ExtraFieldType.choice
+        choices = data.get("choices")
+        multi_choice = data.get("multi_choice")
+        supports_unit = field_type in {
+            schemas.ExtraFieldType.integer,
+            schemas.ExtraFieldType.float_type,
+            schemas.ExtraFieldType.integer_range,
+            schemas.ExtraFieldType.float_range,
+        }
+        if data.get("unit") is not None and not supports_unit:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="unit is only supported for numeric and range fields.",
+            )
+        if is_choice and (not choices or multi_choice is None):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Choice fields require choices and a multi_choice value.",
+            )
+        if not is_choice and (choices is not None or multi_choice is not None):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="choices and multi_choice are only valid for choice fields.",
+            )
+        native_type, config = _native_system_extra_field_type(
+            field_type,
+            multi_choice,
+        )
+        if native_type in {"number", "range"} and data.get("unit") is not None:
+            config["unit"] = data["unit"]
+        if existing_field is not None:
+            if existing_field.source:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        f"Cannot edit plugin-managed field "
+                        f"(source: {existing_field.source})."
+                    ),
+                )
+            existing_type = _system_extra_field_type(existing_field)
+            if existing_type != field_type:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Field type cannot be changed.",
+                )
+            if is_choice:
+                existing_multi_choice = existing_field.field_type == "multiselect"
+                if existing_multi_choice != multi_choice:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Multi choice cannot be changed.",
+                    )
+                if existing_field.options and not set(existing_field.options).issubset(
+                    choices
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Cannot remove existing choices.",
+                    )
+            native_type = existing_field.field_type
+            config = dict(existing_field.config or {})
+            if native_type in {"number", "range"}:
+                config.pop("unit", None)
+                if data.get("unit") is not None:
+                    config["unit"] = data["unit"]
+        default_value = _native_default_value(
+            field_type,
+            _decode_spoolman_field_default(
+                field_type,
+                data.get("default_value"),
+                choices,
+                multi_choice,
+            ),
+        )
+
+        if existing_field is None:
+            native_field = SystemExtraField(
+                target_type=entity_type,
+                key=key,
+                source=None,
+            )
+            self.db.add(native_field)
+        else:
+            native_field = existing_field
+        native_field.label = data["name"]
+        native_field.default_value = default_value
+        native_field.field_type = native_type
+        native_field.options = choices if is_choice else None
+        native_field.config = config or None
+        try:
+            await self.db.commit()
+        except IntegrityError as exc:
+            await self.db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Extra-field key {key!r} already exists.",
+            ) from exc
+        return await self.get_extra_fields(entity_type)
+
+    async def delete_extra_field(
+        self, entity_type: str, key: str
+    ) -> list[schemas.ExtraField] | None:
+        result = await self.db.execute(
+            select(SystemExtraField).where(
+                SystemExtraField.target_type == entity_type,
+                SystemExtraField.key == key,
+            )
+        )
+        native_field = result.scalar_one_or_none()
+        if native_field is None:
+            return None
+        if native_field.source:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    f"Cannot delete plugin-managed field "
+                    f"(source: {native_field.source})."
+                ),
+            )
+        await self.db.delete(native_field)
+        await self.db.commit()
+        return await self.get_extra_fields(entity_type)
 
     async def get_external_filaments(self) -> list:
         return []
