@@ -62,10 +62,28 @@ http://<filaman-host>:8000/spoolman/api/v1/
 | GET | `/location` | List locations |
 | PATCH | `/location/{name}` | Rename location |
 | GET/POST | `/setting/{key}` | Get / set settings |
+| GET | `/field/{entity_type}` | Read Spoolman extra-field definitions mapped to Filaman's native System Extra Fields |
+| POST | `/field/{entity_type}/{key}` | Create or update a native Filaman System Extra Field from a Spoolman definition |
+| DELETE | `/field/{entity_type}/{key}` | Delete a user-managed native Filaman System Extra Field |
 | GET | `/export/spools` | Export spools (CSV/JSON) |
 | GET | `/export/filaments` | Export filaments (CSV/JSON) |
 | GET | `/export/vendors` | Export vendors (CSV/JSON) |
 | POST | `/backup` | Create backup |
+
+The field endpoints read and manage native Filaman System Extra Field definitions
+through the Spoolman API, for filament and spool entities.
+Numeric fields use Filaman's `decimal_places` setting to distinguish integer from
+float types; dropdowns and multiselects map to Spoolman's choice type. Native formula
+fields are omitted because Spoolman's field schema cannot represent computed fields.
+Vendor fields are not included because Filaman System Extra Fields do not support
+vendors. Deleting a field removes its definition but leaves existing custom-field
+values on filaments or spools unchanged. Plugin-managed definitions cannot be deleted
+through the Spoolman API. Supported Spoolman field types are `text`, `integer`,
+`integer_range`, `float`, `float_range`, `datetime`, `boolean` and `choice`. Choice
+fields require a non-empty `choices` list and an explicit `multi_choice` flag;
+`default_value` must be a JSON-encoded value of the corresponding type. POST updates
+an existing field of the same type, but cannot change its type or remove existing
+choices.
 
 ## License
 
